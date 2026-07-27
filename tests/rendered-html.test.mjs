@@ -1,28 +1,81 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { access, readFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 
 const templateRoot = new URL("../", import.meta.url);
+const projectRoot = fileURLToPath(templateRoot);
+
+async function availablePort() {
+  const listener = createServer();
+  listener.unref();
+  await new Promise((resolve, reject) => {
+    listener.once("error", reject);
+    listener.listen(0, "127.0.0.1", resolve);
+  });
+  const address = listener.address();
+  assert(address && typeof address !== "string");
+  await new Promise((resolve, reject) => {
+    listener.close((error) => (error ? reject(error) : resolve()));
+  });
+  return address.port;
+}
 
 async function render() {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
-
-  return worker.fetch(
-    new Request("http://localhost/", {
-      headers: { accept: "text/html", host: "localhost" },
-    }),
+  const port = await availablePort();
+  const nextBin = fileURLToPath(
+    new URL("../node_modules/next/dist/bin/next", import.meta.url),
+  );
+  const server = spawn(
+    process.execPath,
+    [nextBin, "start", "--hostname", "127.0.0.1", "--port", String(port)],
     {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
+      cwd: projectRoot,
+      env: { ...process.env, NODE_ENV: "production" },
+      stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  let output = "";
+  server.stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+  server.stderr.on("data", (chunk) => {
+    output += chunk;
+  });
+  server.on("error", (error) => {
+    output += error.stack ?? error.message;
+  });
+
+  try {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (server.exitCode !== null) {
+        throw new Error(`Next.js exited before serving the page:\n${output}`);
+      }
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/`, {
+          headers: { accept: "text/html" },
+        });
+        const body = await response.arrayBuffer();
+        return new Response(body, {
+          headers: response.headers,
+          status: response.status,
+        });
+      } catch {
+        await delay(100);
+      }
+    }
+    throw new Error(`Timed out waiting for Next.js:\n${output}`);
+  } finally {
+    if (server.exitCode === null) {
+      const exited = once(server, "exit");
+      server.kill();
+      await Promise.race([exited, delay(5_000)]);
+    }
+  }
 }
 
 test("server-renders the complete Rewrite product case", async () => {
@@ -76,5 +129,5 @@ test("ships product assets and removes the disposable starter", async () => {
   assert.doesNotMatch(layout, /Starter Project|codex-preview/);
   assert.deepEqual(JSON.parse(hosting), { d1: null, r2: null });
 
-  await access(new URL("dist/server/index.js", templateRoot));
+  await access(new URL(".next/BUILD_ID", templateRoot));
 });
